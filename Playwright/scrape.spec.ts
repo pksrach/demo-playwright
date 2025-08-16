@@ -98,6 +98,22 @@ test('scrape all products', async ({ page }) => {
             if (aria === 'page') {
                 const span = await link.$('span');
                 category = span ? (await span.evaluate(s => s.textContent?.trim())) ?? null : null;
+
+                // normalize to title case (capitalize each word; preserve hyphenated parts)
+                if (category) {
+                    const toTitleCase = (str: string) =>
+                        str
+                            .trim()
+                            .split(/\s+/)
+                            .map(word =>
+                                word
+                                    .split('-')
+                                    .map(part => part ? (part[0].toUpperCase() + part.slice(1).toLowerCase()) : '')
+                                    .join('-')
+                            )
+                            .join(' ');
+                    category = toTitleCase(category);
+                }
                 break;
             }
         }
@@ -111,6 +127,7 @@ test('scrape all products', async ({ page }) => {
 
             const products = await item.$$('.product-item');
             for (const product of products) {
+                // title name default
                 const nameHandle = await product.$('.title-and-rating h2');
                 let description: string[] = [];
                 let rawHtml: string | null = null;
@@ -285,6 +302,8 @@ test('scrape all products', async ({ page }) => {
                     const priceNumber = price ? String(price).replace(/[^0-9.]/g, '') : '';
                     const code = getCodeForProduct(name, priceNumber, category, image);
 
+                    const nameWithCode = `${name} - ${code}`;
+
                     // skip duplicate products by code
                     if (pushedCodes.has(code)) {
                         console.log('Skipping duplicate product with code', code, 'name:', name)
@@ -292,7 +311,7 @@ test('scrape all products', async ({ page }) => {
                         pushedCodes.add(code)
                         results.push({
                             code,
-                            name,
+                            name: nameWithCode,
                             brand,
                             category,
                             price,
