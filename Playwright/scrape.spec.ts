@@ -1,4 +1,5 @@
 import { test } from '@playwright/test';
+import crypto from 'crypto';
 import { writeFile } from 'fs/promises';
 import path from 'path';
 import * as XLSX from 'xlsx';
@@ -18,7 +19,57 @@ test('scrape all products', async ({ page }) => {
         'https://phannacomputershop.com/cat/pc-part/'
     ];
 
+
+    // deterministic / unique code helpers (8 chars A-Z0-9)
+    const usedCodes = new Set<string>();
+    const fingerprintToCode = new Map<string, string>();
+    const CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+
+    function generateRandomCode(): string {
+        while (true) {
+            let out = '';
+            for (let i = 0; i < 8; i++) {
+                out += CHARS[crypto.randomInt(0, CHARS.length)];
+            }
+            if (!usedCodes.has(out)) {
+                usedCodes.add(out);
+                return out;
+            }
+        }
+    }
+
+    function normalizeKeyForFingerprint(name: string, price: string, category: string | null, image: string | null) {
+        const n = (name || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const p = (price || '').replace(/[^0-9.]/g, '').trim(); // numeric price normalized
+        const c = (category || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        const i = (image || '').toLowerCase().replace(/\s+/g, ' ').trim();
+        return `${n}||${p}||${c}||${i}`;
+    }
+
+    function codeFromHash(hashHex: string): string {
+        try {
+            const base36 = BigInt('0x' + hashHex).toString(36).toUpperCase().replace(/[^A-Z0-9]/g, '');
+            const cand = (base36 + '00000000').slice(0, 8);
+            if (!usedCodes.has(cand)) {
+                usedCodes.add(cand);
+                return cand;
+            }
+        } catch (e) {
+            // fall through to random
+        }
+        return generateRandomCode();
+    }
+
+    function getCodeForProduct(name: string, price: string, category: string | null, image: string | null) {
+        const key = normalizeKeyForFingerprint(name, price, category, image);
+        if (fingerprintToCode.has(key)) return fingerprintToCode.get(key)!;
+        const hash = crypto.createHash('sha256').update(key).digest('hex');
+        const code = codeFromHash(hash);
+        fingerprintToCode.set(key, code);
+        return code;
+    }
     const results: {
+        code: string;
         name: string;
         brand: string | null;
         category: string | null;
@@ -27,6 +78,8 @@ test('scrape all products', async ({ page }) => {
         specs: string[];
         rawHtml: string | null;
     }[] = [];
+
+    const pushedCodes = new Set<string>();
 
     for (const url of urls) {
         console.log('Processing', url);
@@ -113,6 +166,8 @@ test('scrape all products', async ({ page }) => {
                     // 2) Collapse any sequence of whitespace to a single space.
                     // 3) Trim leading/trailing spaces.
                     // 4) Remove spaces directly inside parentheses: "( AIO )" -> "(AIO)".
+
+                    // This name fetch only first line of descripton
                     const cleanedCandidate = rawCandidate
                         ? rawCandidate
                             .replace(/\u00A0/g, ' ')
@@ -226,15 +281,26 @@ test('scrape all products', async ({ page }) => {
                 const specs = description;
 
                 if (name) {
-                    results.push({
-                        name,
-                        brand,
-                        category,
-                        price,
-                        image,
-                        specs,
-                        rawHtml
-                    });
+                    // generate deterministic 8-char code based on name + price + category
+                    const priceNumber = price ? String(price).replace(/[^0-9.]/g, '') : '';
+                    const code = getCodeForProduct(name, priceNumber, category, image);
+
+                    // skip duplicate products by code
+                    if (pushedCodes.has(code)) {
+                        console.log('Skipping duplicate product with code', code, 'name:', name)
+                    } else {
+                        pushedCodes.add(code)
+                        results.push({
+                            code,
+                            name,
+                            brand,
+                            category,
+                            price,
+                            image,
+                            specs,
+                            rawHtml
+                        });
+                    }
                 }
             }
         }
@@ -264,7 +330,7 @@ test('scrape all products', async ({ page }) => {
             return {
                 _id: '',
                 ID: idx + 1,
-                Code: '',
+                Code: r.code,
                 Name: r.name,
                 Price: priceNumber,
                 'In Stock': 0,
