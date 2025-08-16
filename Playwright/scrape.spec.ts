@@ -25,6 +25,16 @@ test('scrape all products', async ({ page }) => {
     const fingerprintToCode = new Map<string, string>();
     const CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
+    type PropCodeGenerateForProduct = {
+        name: string
+        category: string | null
+        cpu: string | null
+        ram: string | null
+        storage: string | null
+        psu: string | null
+        case: string | null
+    };
+
     function generateRandomCode(): string {
         while (true) {
             let out = '';
@@ -38,12 +48,14 @@ test('scrape all products', async ({ page }) => {
         }
     }
 
-    function normalizeKeyForFingerprint(name: string, price: string, category: string | null, image: string | null) {
-        const n = (name || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        const p = (price || '').replace(/[^0-9.]/g, '').trim(); // numeric price normalized
-        const c = (category || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        const i = (image || '').toLowerCase().replace(/\s+/g, ' ').trim();
-        return `${n}||${p}||${c}||${i}`;
+    function normalizeKeyForFingerprint(prop: PropCodeGenerateForProduct) {
+        // include all relevant properties in the fingerprint (normalized)
+        const fields: (keyof PropCodeGenerateForProduct)[] = ['name', 'category', 'cpu', 'ram', 'storage', 'psu', 'case'];
+        const parts = fields.map(k => {
+            const v = (prop[k] ?? '') as string;
+            return v.toLowerCase().replace(/\s+/g, ' ').trim();
+        });
+        return parts.join('||');
     }
 
     function codeFromHash(hashHex: string): string {
@@ -60,8 +72,9 @@ test('scrape all products', async ({ page }) => {
         return generateRandomCode();
     }
 
-    function getCodeForProduct(name: string, price: string, category: string | null, image: string | null) {
-        const key = normalizeKeyForFingerprint(name, price, category, image);
+    function getCodeForProduct(prop: PropCodeGenerateForProduct) {
+
+        const key = normalizeKeyForFingerprint(prop);
         if (fingerprintToCode.has(key)) return fingerprintToCode.get(key)!;
         const hash = crypto.createHash('sha256').update(key).digest('hex');
         const code = codeFromHash(hash);
@@ -173,6 +186,14 @@ test('scrape all products', async ({ page }) => {
 
                 const MAX_NAME_LEN = 256;
                 const visibleTitle = nameHandle ? (await nameHandle.evaluate(el => el.textContent?.trim())) : null;
+
+                // declare spec vars here so they are available later when generating the code
+                let cpuVal: string | null = null;
+                let ramVal: string | null = null;
+                let storageVal: string | null = null;
+                let psuVal: string | null = null;
+                let caseVal: string | null = null;
+
                 // Prefer a description entry that looks like a title (avoid spec lines like "CPU: ...").
                 let name: string = '';
                 if (description && description.length > 0) {
@@ -195,11 +216,7 @@ test('scrape all products', async ({ page }) => {
                         : rawCandidate;
 
                     // Keys to extract; storageKeys treated together (first one wins)
-                    const storageKeys = ['m2', 'ssd', 'storage'];
-
-                    let cpuVal: string | null = null;
-                    let ramVal: string | null = null;
-                    let storageVal: string | null = null;
+                    const storageKeys = ['m2', 'ssd', 'storage', 'hdd', 'pci-e'];
 
                     // Scan description lines for "Key : Value" patterns (case-insensitive),
                     // normalize key by removing non-alphanumerics so variants like "M.2", "m.2", "M.2   " are matched.
@@ -209,7 +226,7 @@ test('scrape all products', async ({ page }) => {
 
                         // global regex to capture multiple "Key: Value" pairs in the same line
                         const pairRegex = /([^:：]+?)\s*[:：]\s*([^:：]+?)(?=(?:\s+[^:：]+?\s*[:：])|$)/g;
-                        let match;
+                        let match: RegExpExecArray | null = null;
                         let foundAny = false;
                         while ((match = pairRegex.exec(text)) !== null) {
                             foundAny = true;
@@ -223,9 +240,11 @@ test('scrape all products', async ({ page }) => {
 
                             if (!cpuVal && keyNormalized === 'cpu') cpuVal = value;
                             if (!ramVal && keyNormalized === 'ram') ramVal = value;
+                            if (!psuVal && keyNormalized === 'psu') psuVal = value;
+                            if (!caseVal && keyNormalized === 'case') caseVal = value;
                             if (!storageVal && storageKeys.includes(keyNormalized)) storageVal = value;
 
-                            if (cpuVal && ramVal && storageVal) break;
+                            if (cpuVal && ramVal && storageVal && psuVal && caseVal) break;
                         }
 
                         // Fallback: single pair match (in case regex didn't find multiple pairs)
@@ -242,19 +261,24 @@ test('scrape all products', async ({ page }) => {
 
                                 if (!cpuVal && keyNormalized === 'cpu') cpuVal = value;
                                 if (!ramVal && keyNormalized === 'ram') ramVal = value;
+                                if (!psuVal && keyNormalized === 'psu') psuVal = value;
+                                if (!caseVal && keyNormalized === 'case') caseVal = value;
                                 if (!storageVal && storageKeys.includes(keyNormalized)) storageVal = value;
                             }
                         }
-                        if (cpuVal && ramVal && storageVal) break; // got everything we want
+                        if (cpuVal && ramVal && storageVal && psuVal && caseVal) break; // got everything we want
                     }
 
                     // Build final name:
                     // - If none of cpuVal/ramVal/storageVal were found, use cleanedCandidate only.
                     // - If any were found, append the found specs (normalized) to the cleanedCandidate.
-                    const hasSpecs = Boolean(cpuVal || ramVal || storageVal);
+                    const hasSpecs = Boolean(cpuVal || ramVal || storageVal || psuVal || caseVal);
                     if (hasSpecs) {
-                        const partsToAppend = [cpuVal, ramVal, storageVal]
-                            .filter(Boolean)
+                        const hasPrimarySpecs = Boolean(cpuVal || ramVal || storageVal);
+                        const partsToAppend = (hasPrimarySpecs
+                            ? [cpuVal, ramVal, storageVal]
+                            : [psuVal, caseVal]
+                        ).filter(Boolean)
                             .map(p => p!.replace(/\s+/g, ' ').trim());
                         name = (
                             (cleanedCandidate ?? '').replace(/\s+/g, ' ').trim()
@@ -266,14 +290,6 @@ test('scrape all products', async ({ page }) => {
                     } else {
                         name = (cleanedCandidate ?? '').replace(/\s+/g, ' ').trim();
                     }
-
-                    /* console.log('rawCandidate=>', rawCandidate);
-                    console.log('titleCandidate=>', cleanedCandidate);
-                    console.log('extracted=>', { cpuVal, ramVal, storageVal });
-                    console.log('description => ', description);
-                    console.log('rawHTML=>', rawHtml);
-                    console.log('name=>', name); */
-
 
                 } else if (visibleTitle) {
                     name = visibleTitle;
@@ -299,8 +315,8 @@ test('scrape all products', async ({ page }) => {
 
                 if (name) {
                     // generate deterministic 8-char code based on name + price + category
-                    const priceNumber = price ? String(price).replace(/[^0-9.]/g, '') : '';
-                    const code = getCodeForProduct(name, priceNumber, category, image);
+                    const propGenerateCode: PropCodeGenerateForProduct = { name, category, cpu: cpuVal, ram: ramVal, storage: storageVal, psu: psuVal, case: caseVal };
+                    const code = getCodeForProduct(propGenerateCode);
 
                     const nameWithCode = `${name} - ${code}`;
 
