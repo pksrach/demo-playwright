@@ -59,29 +59,97 @@ test('scrape all products', async ({ page }) => {
             const products = await item.$$('.product-item');
             for (const product of products) {
                 const nameHandle = await product.$('.title-and-rating h2');
-                let productSpecs: string[] = [];
+                let description: string[] = [];
                 let rawHtml: string | null = null;
                 const listHandle = await product.$('.list');
                 if (listHandle) {
                     // Capture the full innerHTML (do not trim) so we keep markup and structure intact.
                     rawHtml = (await listHandle.evaluate(el => el.innerHTML ?? null)) ?? null;
                     // Prefer individual <li> items when present to avoid grabbing large combined blocks.
-                    productSpecs = await listHandle.$$eval('li', els => els.map(el => el.textContent?.trim()).filter(Boolean));
+                    description = await listHandle.$$eval('li', els => els.map(el => el.textContent?.trim()).filter(Boolean));
                     // Fallback: if no <li> children exist, split the container text by newlines.
-                    if (!productSpecs || productSpecs.length === 0) {
+                    if (!description || description.length === 0) {
                         const text = (await listHandle.evaluate(el => el.textContent?.trim())) || '';
-                        productSpecs = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+                        description = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
                     }
+
+                    // Normalize each description line:
+                    // - replace NBSP with regular space
+                    // - collapse multiple whitespace into single spaces
+                    // - normalize colons to "Key: Value" (no space before, single after)
+                    // - remove spaces directly inside parentheses: "( AIO )" -> "(AIO)"
+                    description = description.map(line => {
+                        if (!line) return line;
+                        let v = line.replace(/\u00A0/g, ' ').trim();
+                        v = v.replace(/\s*[:：]\s*/g, ': ');      // normalize colon spacing (handles fullwidth too)
+                        v = v.replace(/\s+/g, ' ');              // collapse multiple spaces
+                        v = v.replace(/\(\s*(.*?)\s*\)/g, '($1)'); // normalize parentheses spacing
+                        return v.trim();
+                    });
                 }
 
                 const MAX_NAME_LEN = 256;
                 const visibleTitle = nameHandle ? (await nameHandle.evaluate(el => el.textContent?.trim())) : null;
-                // Prefer a productSpecs entry that looks like a title (avoid spec lines like "CPU: ...").
+                // Prefer a description entry that looks like a title (avoid spec lines like "CPU: ...").
                 let name: string = '';
-                if (productSpecs && productSpecs.length > 0) {
-                    // Choose the first specs entry that does not contain a colon (likely not a "key: value" spec)
-                    const titleCandidate = productSpecs.find(s => !/[:：]/.test(s) && (s.length > 3)) ?? productSpecs[0];
-                    name = (titleCandidate ?? '').replace(/\u00A0/g, ' ').trim();
+                if (description && description.length > 0) {
+                    const rawCandidate = description.find(s => !/[:：]/.test(s) && s.length > 3) ?? description[0];
+
+                    // Normalize whitespace and parentheses:
+                    // 1) Replace non-breaking spaces with regular spaces.
+                    // 2) Collapse any sequence of whitespace to a single space.
+                    // 3) Trim leading/trailing spaces.
+                    // 4) Remove spaces directly inside parentheses: "( AIO )" -> "(AIO)".
+                    const cleanedCandidate = rawCandidate
+                        ? rawCandidate
+                            .replace(/\u00A0/g, ' ')
+                            .replace(/\s+/g, ' ')
+                            .trim()
+                            .replace(/\(\s*(.*?)\s*\)/g, '($1)')
+                        : rawCandidate;
+
+                    // Keys to extract; storageKeys treated together (first one wins)
+                    const storageKeys = ['m2', 'ssd', 'storage'];
+
+                    let cpuVal: string | null = null;
+                    let ramVal: string | null = null;
+                    let storageVal: string | null = null;
+
+                    // Scan description lines for "Key : Value" patterns (case-insensitive),
+                    // normalize key by removing non-alphanumerics so variants like "M.2", "m.2", "M.2   " are matched.
+                    for (const line of description) {
+                        if (!line) continue;
+                        const text = line.replace(/\u00A0/g, ' ').trim();
+                        const m = text.match(/^([^:：]+)\s*[:：]\s*(.+)$/);
+                        if (!m) continue;
+                        const rawKey = m[1].trim();
+                        const value = m[2].replace(/\s+/g, ' ').trim().replace(/\(\s*(.*?)\s*\)/g, '($1)');
+                        const keyNormalized = rawKey.replace(/[^a-z0-9]/gi, '').toLowerCase();
+
+                        if (!cpuVal && keyNormalized === 'cpu') cpuVal = value;
+                        if (!ramVal && keyNormalized === 'ram') ramVal = value;
+                        if (!storageVal && storageKeys.includes(keyNormalized)) storageVal = value;
+
+                        if (cpuVal && ramVal && storageVal) break; // got everything we want
+                    }
+
+                    // Build final name: base title + (CPU RAM Storage) if any found.
+                    const partsToAppend = [cpuVal, ramVal, storageVal].filter(Boolean) as string[];
+                    if (partsToAppend.length > 0) {
+                        name = ((cleanedCandidate ?? '').replace(/\s+/g, ' ').trim()
+                            + ' ' + partsToAppend.join(' '))
+                            .replace(/\s+/g, ' ')
+                            .replace(/\(\s*(.*?)\s*\)/g, '($1)')
+                            .trim();
+                    } else {
+                        // fallback to cleaned candidate if no keys found
+                        name = (cleanedCandidate ?? '').replace(/\s+/g, ' ').trim();
+                    }
+                    console.log('rawCandidate=>', rawCandidate);
+                    console.log('titleCandidate=>', cleanedCandidate);
+                    console.log('extracted=>', { cpuVal, ramVal, storageVal });
+                    console.log('description => ', description);
+                    console.log('name=>', name);
                 } else if (visibleTitle) {
                     name = visibleTitle;
                 } else {
@@ -102,7 +170,7 @@ test('scrape all products', async ({ page }) => {
                 const aTag = await product.$('.head a');
                 const image = aTag ? await aTag.getAttribute('href') : null;
 
-                const specs = productSpecs;
+                const specs = description;
 
                 if (name) {
                     results.push({
