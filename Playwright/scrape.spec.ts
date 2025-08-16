@@ -65,8 +65,21 @@ test('scrape all products', async ({ page }) => {
                 if (listHandle) {
                     // Capture the full innerHTML (do not trim) so we keep markup and structure intact.
                     rawHtml = (await listHandle.evaluate(el => el.innerHTML ?? null)) ?? null;
-                    // Prefer individual <li> items when present to avoid grabbing large combined blocks.
-                    description = await listHandle.$$eval('li', els => els.map(el => el.textContent?.trim()).filter(Boolean));
+
+                    // Prefer individual logical lines. Some <li> use <br> inside, so split those into separate lines.
+                    // This evaluates in the page context to preserve HTML -> text conversion reliably.
+                    description = await listHandle.$$eval('li', els =>
+                        els.flatMap(li => {
+                            // turn <br> tags into newlines, then strip remaining tags and split by newlines
+                            const html = li.innerHTML || '';
+                            const withBreaks = html.replace(/<br\s*\/?>/gi, '\n');
+                            const d = document.createElement('div');
+                            d.innerHTML = withBreaks;
+                            const text = (d.textContent || '').trim();
+                            return text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+                        })
+                    );
+
                     // Fallback: if no <li> children exist, split the container text by newlines.
                     if (!description || description.length === 0) {
                         const text = (await listHandle.evaluate(el => el.textContent?.trim())) || '';
@@ -103,6 +116,7 @@ test('scrape all products', async ({ page }) => {
                     const cleanedCandidate = rawCandidate
                         ? rawCandidate
                             .replace(/\u00A0/g, ' ')
+                            .replace(/\s*[:：]\s*/g, ' ')   // remove any colon and surrounding spaces -> single space
                             .replace(/\s+/g, ' ')
                             .trim()
                             .replace(/\(\s*(.*?)\s*\)/g, '($1)')
@@ -120,36 +134,75 @@ test('scrape all products', async ({ page }) => {
                     for (const line of description) {
                         if (!line) continue;
                         const text = line.replace(/\u00A0/g, ' ').trim();
-                        const m = text.match(/^([^:：]+)\s*[:：]\s*(.+)$/);
-                        if (!m) continue;
-                        const rawKey = m[1].trim();
-                        const value = m[2].replace(/\s+/g, ' ').trim().replace(/\(\s*(.*?)\s*\)/g, '($1)');
-                        const keyNormalized = rawKey.replace(/[^a-z0-9]/gi, '').toLowerCase();
 
-                        if (!cpuVal && keyNormalized === 'cpu') cpuVal = value;
-                        if (!ramVal && keyNormalized === 'ram') ramVal = value;
-                        if (!storageVal && storageKeys.includes(keyNormalized)) storageVal = value;
+                        // global regex to capture multiple "Key: Value" pairs in the same line
+                        const pairRegex = /([^:：]+?)\s*[:：]\s*([^:：]+?)(?=(?:\s+[^:：]+?\s*[:：])|$)/g;
+                        let match;
+                        let foundAny = false;
+                        while ((match = pairRegex.exec(text)) !== null) {
+                            foundAny = true;
+                            const rawKey = (match[1] || '').trim();
+                            const value = (match[2] || '')
+                                .replace(/\u00A0/g, ' ')
+                                .replace(/\s+/g, ' ')
+                                .trim()
+                                .replace(/\(\s*(.*?)\s*\)/g, '($1)');
+                            const keyNormalized = rawKey.replace(/[^a-z0-9]/gi, '').toLowerCase();
 
+                            if (!cpuVal && keyNormalized === 'cpu') cpuVal = value;
+                            if (!ramVal && keyNormalized === 'ram') ramVal = value;
+                            if (!storageVal && storageKeys.includes(keyNormalized)) storageVal = value;
+
+                            if (cpuVal && ramVal && storageVal) break;
+                        }
+
+                        // Fallback: single pair match (in case regex didn't find multiple pairs)
+                        if (!foundAny) {
+                            const m = text.match(/^([^:：]+)\s*[:：]\s*(.+)$/);
+                            if (m) {
+                                const rawKey = m[1].trim();
+                                const value = m[2]
+                                    .replace(/\u00A0/g, ' ')
+                                    .replace(/\s+/g, ' ')
+                                    .trim()
+                                    .replace(/\(\s*(.*?)\s*\)/g, '($1)');
+                                const keyNormalized = rawKey.replace(/[^a-z0-9]/gi, '').toLowerCase();
+
+                                if (!cpuVal && keyNormalized === 'cpu') cpuVal = value;
+                                if (!ramVal && keyNormalized === 'ram') ramVal = value;
+                                if (!storageVal && storageKeys.includes(keyNormalized)) storageVal = value;
+                            }
+                        }
                         if (cpuVal && ramVal && storageVal) break; // got everything we want
                     }
 
-                    // Build final name: base title + (CPU RAM Storage) if any found.
-                    const partsToAppend = [cpuVal, ramVal, storageVal].filter(Boolean) as string[];
-                    if (partsToAppend.length > 0) {
-                        name = ((cleanedCandidate ?? '').replace(/\s+/g, ' ').trim()
-                            + ' ' + partsToAppend.join(' '))
+                    // Build final name:
+                    // - If none of cpuVal/ramVal/storageVal were found, use cleanedCandidate only.
+                    // - If any were found, append the found specs (normalized) to the cleanedCandidate.
+                    const hasSpecs = Boolean(cpuVal || ramVal || storageVal);
+                    if (hasSpecs) {
+                        const partsToAppend = [cpuVal, ramVal, storageVal]
+                            .filter(Boolean)
+                            .map(p => p!.replace(/\s+/g, ' ').trim());
+                        name = (
+                            (cleanedCandidate ?? '').replace(/\s+/g, ' ').trim()
+                            + ' ' + partsToAppend.join(' ')
+                        )
                             .replace(/\s+/g, ' ')
                             .replace(/\(\s*(.*?)\s*\)/g, '($1)')
                             .trim();
                     } else {
-                        // fallback to cleaned candidate if no keys found
                         name = (cleanedCandidate ?? '').replace(/\s+/g, ' ').trim();
                     }
-                    console.log('rawCandidate=>', rawCandidate);
+
+                    /* console.log('rawCandidate=>', rawCandidate);
                     console.log('titleCandidate=>', cleanedCandidate);
                     console.log('extracted=>', { cpuVal, ramVal, storageVal });
                     console.log('description => ', description);
-                    console.log('name=>', name);
+                    console.log('rawHTML=>', rawHtml);
+                    console.log('name=>', name); */
+
+
                 } else if (visibleTitle) {
                     name = visibleTitle;
                 } else {
