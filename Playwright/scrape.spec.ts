@@ -12,11 +12,11 @@ test('scrape all products', async ({ page }) => {
     // results will be combined into a single output.json / output.xlsx.
     const urls = [
         'https://phannacomputershop.com/cat/desktop-all-in-1/',
-        'https://phannacomputershop.com/cat/new-desktop/',
-        'https://phannacomputershop.com/cat/new-laptop/',
-        'https://phannacomputershop.com/cat/used-laptop/',
-        'https://phannacomputershop.com/cat/used-desktop/',
-        'https://phannacomputershop.com/cat/pc-part/'
+        // 'https://phannacomputershop.com/cat/new-desktop/',
+        // 'https://phannacomputershop.com/cat/new-laptop/',
+        // 'https://phannacomputershop.com/cat/used-laptop/',
+        // 'https://phannacomputershop.com/cat/used-desktop/',
+        // 'https://phannacomputershop.com/cat/pc-part/'
     ];
 
 
@@ -194,6 +194,9 @@ test('scrape all products', async ({ page }) => {
                 let psuVal: string | null = null;
                 let caseVal: string | null = null;
 
+                // mornitor display
+                let resolutionVal: string | null = null;
+
                 // Prefer a description entry that looks like a title (avoid spec lines like "CPU: ...").
                 let name: string = '';
                 if (description && description.length > 0) {
@@ -216,11 +219,13 @@ test('scrape all products', async ({ page }) => {
                         : rawCandidate;
 
                     // Keys to extract; storageKeys treated together (first one wins)
-                    const storageKeys = ['m2', 'ssd', 'storage', 'hdd', 'pci-e'];
+                    const storageKeys = ['m2', 'm.2', 'ssd', 'storage', 'hdd', 'pci-e'];
 
                     // Scan description lines for "Key : Value" patterns (case-insensitive),
                     // normalize key by removing non-alphanumerics so variants like "M.2", "m.2", "M.2   " are matched.
-                    for (const line of description) {
+                    // Use an index loop so we can look ahead (useful for headings like "Memory" / "Processor")
+                    for (let i = 0; i < description.length; i++) {
+                        const line = description[i];
                         if (!line) continue;
                         const text = line.replace(/\u00A0/g, ' ').trim();
 
@@ -228,6 +233,9 @@ test('scrape all products', async ({ page }) => {
                         const pairRegex = /([^:：]+?)\s*[:：]\s*([^:：]+?)(?=(?:\s+[^:：]+?\s*[:：])|$)/g;
                         let match: RegExpExecArray | null = null;
                         let foundAny = false;
+
+                        // collect values in order of appearance (used as fallback for cpu)
+                        const valuesInLine: string[] = [];
                         while ((match = pairRegex.exec(text)) !== null) {
                             foundAny = true;
                             const rawKey = (match[1] || '').trim();
@@ -236,6 +244,7 @@ test('scrape all products', async ({ page }) => {
                                 .replace(/\s+/g, ' ')
                                 .trim()
                                 .replace(/\(\s*(.*?)\s*\)/g, '($1)');
+                            valuesInLine.push(value);
                             const keyNormalized = rawKey.replace(/[^a-z0-9]/gi, '').toLowerCase();
 
                             if (!cpuVal && keyNormalized === 'cpu') cpuVal = value;
@@ -244,7 +253,151 @@ test('scrape all products', async ({ page }) => {
                             if (!caseVal && keyNormalized === 'case') caseVal = value;
                             if (!storageVal && storageKeys.includes(keyNormalized)) storageVal = value;
 
+                            // existing freeform detection inside the pair loop (kept as-is)
+                            if (!storageVal) {
+                                const freeformStorageRegex = /\b(m\.?2|nvme|pci-?e|pcie|ssd|hdd|storage)\b/i;
+                                if (freeformStorageRegex.test(text)) {
+                                    const cap = text.match(/(\d+(?:\.\d+)?\s*(?:TB|GB))/i);
+                                    storageVal = (cap ? cap[0] : text).replace(/\s+/g, ' ').trim();
+                                }
+                            }
+
                             if (cpuVal && ramVal && storageVal && psuVal && caseVal) break;
+                        }
+
+                        // If no "Key: Value" pairs matched (or storage still not found),
+                        // try a more robust freeform storage normalizer that captures PCIe version + capacity.
+                        if (!storageVal) {
+                            const normalizeStorageFromText = (t: string) => {
+                                const s = t.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+                                // detect primary type
+                                const typeMatch = s.match(/\b(m\.?2|m2|nvme|mvme|ssd|hdd|storage)\b/i);
+                                // detect PCIe/PCIE + version (e.g. PCIe 5.0 or PCIe4.0)
+                                const pcieMatch = s.match(/\bpcie(?:\s*[-]?\s*|\s*)(\d+(?:\.\d+)?)\b/i) || s.match(/\bpci-?e\b/i);
+                                // detect NVMe/MVMe token
+                                const nvmeMatch = s.match(/\b(nvme|mvme)\b/i);
+                                // capacity
+                                const capMatch = s.match(/(\d+(?:\.\d+)?\s*(?:TB|GB))/i);
+
+                                const parts: string[] = [];
+                                if (typeMatch) {
+                                    const t0 = typeMatch[1] ?? typeMatch[0];
+                                    if (/m\.?2|m2/i.test(t0)) parts.push('M.2');
+                                    else parts.push(t0.toUpperCase());
+                                }
+                                if (pcieMatch) {
+                                    // pcieMatch[1] exists when there's a numeric version
+                                    if (pcieMatch[1]) parts.push(`PCIe ${pcieMatch[1]}`);
+                                    else parts.push('PCIe');
+                                }
+                                if (nvmeMatch && !parts.some(p => /NVME/i.test(p))) parts.push('NVMe');
+                                if (capMatch) {
+                                    // normalize capacity spacing to e.g. "2TB"
+                                    parts.push(capMatch[1].replace(/\s+/g, '').toUpperCase());
+                                }
+
+                                // If we have useful parts return them, otherwise fall back to the cleaned line
+                                const out = parts.join(' ').replace(/\s+/g, ' ').trim();
+                                return out || s;
+                            };
+
+                            // run the normalizer on the whole text line
+                            if (/\b(m\.?2|m2|nvme|mvme|pci-?e|pcie|ssd|hdd|storage)\b/i.test(text)) {
+                                storageVal = normalizeStorageFromText(text);
+                            }
+                        }
+
+                        // If cpu wasn't explicitly provided but other specs were found,
+                        // try smarter fallbacks:
+                        // 1) find a CPU-like non-key line (contains GHz or common CPU model words)
+                        // 2) otherwise take the second non-key description line (index 1)
+                        // 3) otherwise fall back to valuesInLine (prefer index 1)
+                        if (!cpuVal && (ramVal || storageVal || psuVal || caseVal)) {
+                            const cpuLikeRegex = /\b(i[3579]\b|intel|amd|ryzen|xeon|threadripper|athlon)\b|\d+(\.\d+)?\s*GHz/i;
+                            const nonKeyLines = (description || []).filter(l => l && !/[:：]/.test(l));
+                            let candidateLine: string | null = null;
+
+                            for (const nl of nonKeyLines) {
+                                if (cpuLikeRegex.test(nl)) { candidateLine = nl; break; }
+                            }
+                            if (!candidateLine && nonKeyLines.length > 1) {
+                                // user case: index 1 is often the CPU line (e.g. "Ultra 9 285K 3.2GHz")
+                                candidateLine = nonKeyLines[1];
+                            }
+                            if (!candidateLine && valuesInLine.length > 0) {
+                                candidateLine = (valuesInLine[1] ?? valuesInLine[0]) || null;
+                            }
+
+                            if (candidateLine) {
+                                cpuVal = candidateLine
+                                    .replace(/\u00A0/g, ' ')
+                                    .replace(/\s+/g, ' ')
+                                    .trim()
+                                    .replace(/\(\s*(.*?)\s*\)/g, '($1)');
+                            }
+                        }
+
+                        // Extra heuristics: handle headings and neighbor lines
+                        // - "Processor" heading often followed by CPU details on same or next line
+                        // - "Memory" heading often followed by DDR line on the next line
+                        if (!cpuVal) {
+                            // "Processor" as heading or inline descriptor
+                            if (/\bprocessor\b/i.test(text)) {
+                                // prefer same line details after the word "Processor"
+                                // otherwise take the next non-empty line
+                                const after = text.replace(/.*processor[:\s\-]*?/i, '').trim();
+                                const nextLine = (description[i + 1] || '').trim();
+                                const pick = after.length > 0 ? after : nextLine;
+                                if (pick && /\d+(\.\d+)?\s*GHz|\bcore\b|\bCPU\b|CPUs?/i.test(pick)) {
+                                    cpuVal = pick.replace(/\s+/g, ' ').trim();
+                                } else if (pick) {
+                                    // fallback: take short summary as cpuVal
+                                    cpuVal = pick.replace(/\s+/g, ' ').trim();
+                                }
+                            } else {
+                                // lines that mention "CPUs", "core", "GHz" without "Processor"
+                                if (/\bCPUs?\b|\bcore(s)?\b|\d+(\.\d+)?\s*GHz\b/i.test(text)) {
+                                    cpuVal = text.replace(/\s+/g, ' ').trim();
+                                }
+                            }
+                        }
+
+                        // Memory heading + adjacent DDR line handling
+                        if (!ramVal) {
+                            // If this line is a Memory heading, look at next non-empty line
+                            if (/^\s*Memory\s*[:\-]?\s*$/i.test(text)) {
+                                const nextLine = (description[i + 1] || '').trim();
+                                if (nextLine) {
+                                    const m1 = nextLine.match(/\b(DDR[345]X?)\b[\s,;:-]*?(\d+(?:\.\d+)?\s*GB)?/i);
+                                    const m2 = nextLine.match(/(\d+(?:\.\d+)?\s*GB)[\s,;:-]*?(DDR[345]X?)/i);
+                                    if (m1 || m2) {
+                                        const ddr = (m1 && m1[1]) || (m2 && m2[2]) || null;
+                                        const cap = (m1 && m1[2]) || (m2 && m2[1]) || null;
+                                        if (ddr) {
+                                            ramVal = (ddr.toUpperCase() + (cap ? ' ' + cap.replace(/\s+/g, '').toUpperCase() : '')).trim();
+                                        } else if (cap) {
+                                            ramVal = cap.replace(/\s+/g, '').toUpperCase();
+                                        }
+                                    } else {
+                                        // fallback: if nextLine contains a capacity like "16GB" use it
+                                        const cap = nextLine.match(/(\d+(?:\.\d+)?\s*GB)/i);
+                                        if (cap) ramVal = cap[1].replace(/\s+/g, '').toUpperCase();
+                                    }
+                                }
+                            } else {
+                                // If this line itself contains DDR/capacity info, use existing regexes too
+                                const m1 = text.match(/\b(DDR[345]X?)\b[\s,;:-]*?(\d+(?:\.\d+)?\s*GB)?/i);
+                                const m2 = text.match(/(\d+(?:\.\d+)?\s*GB)[\s,;:-]*?(DDR[345]X?)/i);
+                                if (m1 || m2) {
+                                    const ddr = (m1 && m1[1]) || (m2 && m2[2]) || null;
+                                    const cap = (m1 && m1[2]) || (m2 && m2[1]) || null;
+                                    if (ddr) {
+                                        ramVal = (ddr.toUpperCase() + (cap ? ' ' + cap.replace(/\s+/g, '').toUpperCase() : '')).trim();
+                                    } else if (cap) {
+                                        ramVal = cap[1].replace(/\s+/g, '').toUpperCase();
+                                    }
+                                }
+                            }
                         }
 
                         // Fallback: single pair match (in case regex didn't find multiple pairs)
@@ -266,6 +419,27 @@ test('scrape all products', async ({ page }) => {
                                 if (!storageVal && storageKeys.includes(keyNormalized)) storageVal = value;
                             }
                         }
+
+                        // Detect DDR memory lines (e.g. "8GB DDR4", "DDR5 16GB", "DDR5X 32GB")
+                        if (!ramVal) {
+                            // Try both orders: "DDR4 8GB" and "8GB DDR4"
+                            const m1 = text.match(/\b(DDR[345]X?)\b[\s,;:-]*?(\d+(?:\.\d+)?\s*GB)?/i);
+                            const m2 = text.match(/(\d+(?:\.\d+)?\s*GB)[\s,;:-]*?(DDR[345]X?)/i);
+                            let ddr: string | null = null;
+                            let cap: string | null = null;
+                            if (m1) {
+                                ddr = m1[1];
+                                cap = m1[2] || null;
+                            } else if (m2) {
+                                cap = m2[1];
+                                ddr = m2[2];
+                            }
+                            if (ddr) {
+                                // Normalize to "DDR4 8GB" or "DDR5X" if capacity missing
+                                ramVal = (ddr.toUpperCase() + (cap ? ' ' + cap.replace(/\s+/g, '').toUpperCase() : '')).trim();
+                            }
+                        }
+
                         if (cpuVal && ramVal && storageVal && psuVal && caseVal) break; // got everything we want
                     }
 
@@ -280,10 +454,79 @@ test('scrape all products', async ({ page }) => {
                             : [psuVal, caseVal]
                         ).filter(Boolean)
                             .map(p => p!.replace(/\s+/g, ' ').trim());
-                        name = (
-                            (cleanedCandidate ?? '').replace(/\s+/g, ' ').trim()
-                            + ' ' + partsToAppend.join(' ')
-                        )
+
+                        // new: include visible title (from .title-and-rating h2) as a prefix,
+                        // but avoid duplicating it if the cleanedCandidate already starts with it.
+                        const baseName = (cleanedCandidate ?? '').replace(/\s+/g, ' ').trim();
+                        const prefixText = visibleTitle ? visibleTitle.replace(/\s+/g, ' ').trim() : '';
+                        let combined = baseName;
+
+                        if (prefixText) {
+                            const baseLower = (baseName || '').toLowerCase();
+                            const prefixLower = prefixText.toLowerCase();
+                            if (baseLower.length === 0 || !baseLower.startsWith(prefixLower)) {
+                                combined = prefixText + ' ' + combined;
+                            }
+                        }
+
+                        // normalize, dedupe and avoid appending parts already present in base/prefix
+                        const normalizeSpecPart = (s: string) => {
+                            let p = s.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
+                            // canonical tokens
+                            p = p.replace(/\bmvme\b/ig, 'NVMe');
+                            p = p.replace(/\bnvme\b/ig, 'NVMe');
+                            p = p.replace(/\bm\.?2\b/ig, 'M.2');
+                            p = p.replace(/\bssd\b/ig, 'SSD');
+                            // PCIe version normalization: "PCIe5.0", "PCIe 5.0", "PCI-E4" -> "PCIe 5.0" or "PCIe 4"
+                            p = p.replace(/\bpcie\s*[-]?\s*(\d+(?:\.\d+)?)\b/ig, (_m, ver) => `PCIe ${ver}`);
+                            p = p.replace(/\bpci-?e\b/ig, 'PCIe');
+                            return p.replace(/\s+/g, ' ').trim();
+                        };
+
+                        const baseLower = (baseName || '').toLowerCase();
+                        const prefixLower = prefixText ? prefixText.toLowerCase() : '';
+                        const seen = new Set<string>();
+                        const filteredParts: string[] = [];
+                        for (const raw of partsToAppend) {
+                            const p = normalizeSpecPart(raw);
+                            const key = p.toLowerCase();
+                            if (!p) continue;
+                            if (seen.has(key)) continue;               // internal duplicate (e.g. MVMe vs NVMe)
+                            if (baseLower.includes(key) || prefixLower.includes(key)) continue; // already in base/prefix
+                            seen.add(key);
+                            filteredParts.push(p);
+                        }
+                        if (filteredParts.length) combined = combined + ' ' + filteredParts.join(' ');
+
+                        // collapse repeated adjacent phrases (handles multi-word repeats)
+                        const collapseRepeatedPhrases = (s: string, maxWords = 6) => {
+                            const words = s.split(/\s+/).filter(Boolean);
+                            let i = 0;
+                            while (i < words.length) {
+                                let removed = false;
+                                const maxLen = Math.min(maxWords, Math.floor((words.length - i) / 2));
+                                for (let len = maxLen; len >= 1; len--) {
+                                    let same = true;
+                                    for (let k = 0; k < len; k++) {
+                                        if ((words[i + k] || '').toLowerCase() !== (words[i + len + k] || '').toLowerCase()) {
+                                            same = false;
+                                            break;
+                                        }
+                                    }
+                                    if (same) {
+                                        // remove the second occurrence
+                                        words.splice(i + len, len);
+                                        removed = true;
+                                        break;
+                                    }
+                                }
+                                if (!removed) i++;
+                            }
+                            return words.join(' ');
+                        };
+
+                        combined = collapseRepeatedPhrases(combined);
+                        name = combined
                             .replace(/\s+/g, ' ')
                             .replace(/\(\s*(.*?)\s*\)/g, '($1)')
                             .trim();
@@ -322,7 +565,7 @@ test('scrape all products', async ({ page }) => {
 
                     // skip duplicate products by code
                     if (pushedCodes.has(code)) {
-                        console.log('Skipping duplicate product with code', code, 'name:', name)
+                        //console.log('Skipping duplicate product with code', code, 'name:', name)
                     } else {
                         pushedCodes.add(code)
                         results.push({
