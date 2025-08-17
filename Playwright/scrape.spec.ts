@@ -12,11 +12,11 @@ test('scrape all products', async ({ page }) => {
     // results will be combined into a single output.json / output.xlsx.
     const urls = [
         'https://phannacomputershop.com/cat/desktop-all-in-1/',
-        // 'https://phannacomputershop.com/cat/new-desktop/',
-        // 'https://phannacomputershop.com/cat/new-laptop/',
-        // 'https://phannacomputershop.com/cat/used-laptop/',
-        // 'https://phannacomputershop.com/cat/used-desktop/',
-        // 'https://phannacomputershop.com/cat/pc-part/'
+        'https://phannacomputershop.com/cat/new-desktop/',
+        'https://phannacomputershop.com/cat/new-laptop/',
+        'https://phannacomputershop.com/cat/used-laptop/',
+        'https://phannacomputershop.com/cat/used-desktop/',
+        'https://phannacomputershop.com/cat/pc-part/'
     ];
 
 
