@@ -6,4 +6,5 @@ node_modules/
 /blob-report/
 /playwright/.cache/
 output.*
+duplicate_output.*
 .~lock.output.*
