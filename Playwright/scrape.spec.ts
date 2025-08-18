@@ -93,6 +93,17 @@ test('scrape all products', async ({ page }) => {
         rawHtml: string | null;
     }[] = [];
 
+    const duplicates: {
+        code: string;
+        name: string;
+        brand: string | null;
+        category: string | null;
+        price: string;
+        image: string | null;
+        specs: string[];
+        rawHtml: string | null;
+    }[] = [];
+
     const pushedCodes = new Set<string>();
 
     for (const url of urls) {
@@ -676,7 +687,17 @@ test('scrape all products', async ({ page }) => {
 
                     // skip duplicate products by code
                     if (pushedCodes.has(code)) {
-                        //console.log('Skipping duplicate product with code', code, 'name:', name)
+                        // record duplicate product for later inspection
+                        duplicates.push({
+                            code,
+                            name: nameWithCode,
+                            brand,
+                            category,
+                            price,
+                            image,
+                            specs,
+                            rawHtml
+                        });
                     } else {
                         pushedCodes.add(code)
                         results.push({
@@ -701,6 +722,15 @@ test('scrape all products', async ({ page }) => {
         console.log('Saved results to', outPath);
     } catch (err) {
         console.error('Failed to write results:', err);
+    }
+
+    // write duplicates to separate files for inspection
+    const dupOutPath = path.resolve(__dirname, '..', 'duplicate_output.json');
+    try {
+        await writeFile(dupOutPath, JSON.stringify(duplicates, null, 2), 'utf8');
+        console.log('Saved duplicate results to', dupOutPath);
+    } catch (err) {
+        console.error('Failed to write duplicate results:', err);
     }
 
     try {
@@ -760,6 +790,42 @@ test('scrape all products', async ({ page }) => {
         const outXlsxPath = path.resolve(__dirname, '..', 'output.xlsx');
         XLSX.writeFile(wb, outXlsxPath);
         console.log('Saved excel to', outXlsxPath);
+        // write duplicates xlsx as well
+        try {
+            const dupRows = duplicates.map((r, idx) => {
+                const priceNumber = r.price ? String(r.price).replace(/[^0-9.]/g, '') : '';
+                const descriptionHtml = (r.rawHtml && r.rawHtml.length)
+                    ? r.rawHtml
+                    : (r.specs && r.specs.length) ? `<ul>${r.specs.map(s => `<li>${s}</li>`).join('')}</ul>` : '';
+                return {
+                    _id: '',
+                    ID: idx + 1,
+                    Code: r.code,
+                    Name: r.name,
+                    Price: priceNumber,
+                    'In Stock': 0,
+                    Image: r.image ?? '',
+                    Images: r.image ? JSON.stringify([r.image.toString()]) : '',
+                    Category: r.category ?? '',
+                    'Item Type': 'simple',
+                    Description: descriptionHtml,
+                    Published: 1,
+                } as any;
+            });
+
+            const aoaDup: any[][] = [
+                headers,
+                ...dupRows.map(row => headers.map(h => row[h] ?? ''))
+            ];
+            const wsDup = XLSX.utils.aoa_to_sheet(aoaDup);
+            const wbDup = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wbDup, wsDup, 'Sheet1');
+            const dupXlsxPath = path.resolve(__dirname, '..', 'duplicate_output.xlsx');
+            XLSX.writeFile(wbDup, dupXlsxPath);
+            console.log('Saved duplicate excel to', dupXlsxPath);
+        } catch (err) {
+            console.error('Failed to write duplicate excel file:', err);
+        }
     } catch (err) {
         console.error('Failed to write excel file:', err);
     }
