@@ -1,6 +1,6 @@
 import { test } from '@playwright/test';
 import crypto from 'crypto';
-import { writeFile } from 'fs/promises';
+import { writeFile, mkdir } from 'fs/promises';
 import path from 'path';
 import * as XLSX from 'xlsx';
 
@@ -9,7 +9,7 @@ test.setTimeout(120_000); // all tests in this file use 120s
 
 test('scrape all products', async ({ page }) => {
     // Add multiple URLs to this array. All pages will be scraped and the
-    // results will be combined into a single output.json / output.xlsx.
+    // results will be combined into a single outputs.json / outputs.xlsx.
     const urls = [
         'https://phannacomputershop.com/cat/desktop-all-in-1/',
         'https://phannacomputershop.com/cat/new-desktop/',
@@ -106,8 +106,21 @@ test('scrape all products', async ({ page }) => {
 
     const pushedCodes = new Set<string>();
 
-    for (const url of urls) {
+    // Common CSV/XLSX headers (used for global and per-URL exports)
+    const headers = [
+        '_id', 'ID', 'Code', 'Name', 'Price', 'In Stock', 'Image', 'Images', 'Category', 'Item Type',
+        'Description', 'Published', 'Price ID 1', 'Barcode 1', 'Price 1', 'Currency 1', 'Unit Name 1',
+        'Unit Rank 1', 'Unit Size 1', 'Type 1', 'Price ID 2', 'Barcode 2', 'Price 2', 'Currency 2',
+        'Unit Name 2', 'Unit Rank 2', 'Unit Size 2', 'Type 2'
+    ];
+
+    for (let urlIndex = 0; urlIndex < urls.length; urlIndex++) {
+        const url = urls[urlIndex];
         console.log('Processing', url);
+
+        // per-URL accumulators
+        const resultsForUrl: typeof results = [];
+        const duplicatesForUrl: typeof duplicates = [];
         try {
             await page.goto(url, { timeout: 120_000, waitUntil: 'load' });
         } catch (err) {
@@ -145,7 +158,7 @@ test('scrape all products', async ({ page }) => {
 
         const items = await page.$$('.site-content .container');
 
-        for (const item of items) {
+    for (const item of items) {
             const brandHandle = await item.$('.section-title h2 span');
             const rawBrand = brandHandle ? (await brandHandle.evaluate(el => el.textContent?.trim())) ?? null : null;
             const brand = rawBrand ? rawBrand.split('-')[0].trim() : null;
@@ -687,8 +700,8 @@ test('scrape all products', async ({ page }) => {
 
                     // skip duplicate products by code
                     if (pushedCodes.has(code)) {
-                        // record duplicate product for later inspection
-                        duplicates.push({
+                        // record duplicate product for later inspection (global + per-url)
+                        const dupItem = {
                             code,
                             name: nameWithCode,
                             brand,
@@ -697,10 +710,12 @@ test('scrape all products', async ({ page }) => {
                             image,
                             specs,
                             rawHtml
-                        });
+                        };
+                        duplicates.push(dupItem);
+                        duplicatesForUrl.push(dupItem);
                     } else {
                         pushedCodes.add(code)
-                        results.push({
+                        const resItem = {
                             code,
                             name: nameWithCode,
                             brand,
@@ -709,28 +724,115 @@ test('scrape all products', async ({ page }) => {
                             image,
                             specs,
                             rawHtml
-                        });
+                        };
+                        results.push(resItem);
+                        resultsForUrl.push(resItem);
                     }
                 }
             }
         }
+
+        // after processing this URL, write per-URL outputs
+        try {
+            const slug = url.replace(/https?:\/\//, '').replace(/[^a-z0-9]+/gi, '_').replace(/^_+|_+$/g, '').toLowerCase();
+            const outJsonDir = path.resolve(__dirname, '..', 'outputs', 'data', 'json');
+            const outXlsxDir = path.resolve(__dirname, '..', 'outputs', 'data', 'xlsx');
+            const dupJsonDir = path.resolve(__dirname, '..', 'outputs', 'redundancy_data', 'json');
+            const dupXlsxDir = path.resolve(__dirname, '..', 'outputs', 'redundancy_data', 'xlsx');
+            await mkdir(outJsonDir, { recursive: true });
+            await mkdir(outXlsxDir, { recursive: true });
+            await mkdir(dupJsonDir, { recursive: true });
+            await mkdir(dupXlsxDir, { recursive: true });
+
+            const perOutJson = path.resolve(outJsonDir, `output_${slug}.json`);
+            await writeFile(perOutJson, JSON.stringify(resultsForUrl, null, 2), 'utf8');
+            console.log('Saved per-URL results to', perOutJson);
+
+            const perDupJson = path.resolve(dupJsonDir, `duplicate_output_${slug}.json`);
+            await writeFile(perDupJson, JSON.stringify(duplicatesForUrl, null, 2), 'utf8');
+            console.log('Saved per-URL duplicate results to', perDupJson);
+
+            // XLSX for resultsForUrl
+            const rowsForUrl = resultsForUrl.map((r, idx) => {
+                const priceNumber = r.price ? String(r.price).replace(/[^0-9.]/g, '') : '';
+                const descriptionHtml = (r.rawHtml && r.rawHtml.length)
+                    ? r.rawHtml
+                    : (r.specs && r.specs.length) ? `<ul>${r.specs.map(s => `<li>${s}</li>`).join('')}</ul>` : '';
+                return {
+                    _id: '',
+                    ID: idx + 1,
+                    Code: r.code,
+                    Name: r.name,
+                    Price: priceNumber,
+                    'In Stock': 0,
+                    Image: r.image ?? '',
+                    Images: r.image ? JSON.stringify([r.image.toString()]) : '',
+                    Category: r.category ?? '',
+                    'Item Type': 'simple',
+                    Description: descriptionHtml,
+                    Published: 1,
+                } as any;
+            });
+            const aoaPer: any[][] = [headers, ...rowsForUrl.map(row => headers.map(h => row[h] ?? ''))];
+            const wsPer = XLSX.utils.aoa_to_sheet(aoaPer);
+            const wbPer = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wbPer, wsPer, 'Sheet1');
+            const perXlsx = path.resolve(outXlsxDir, `output_${slug}.xlsx`);
+            XLSX.writeFile(wbPer, perXlsx);
+            console.log('Saved per-URL excel to', perXlsx);
+
+            // XLSX for duplicatesForUrl
+            const rowsDupForUrl = duplicatesForUrl.map((r, idx) => {
+                const priceNumber = r.price ? String(r.price).replace(/[^0-9.]/g, '') : '';
+                const descriptionHtml = (r.rawHtml && r.rawHtml.length)
+                    ? r.rawHtml
+                    : (r.specs && r.specs.length) ? `<ul>${r.specs.map(s => `<li>${s}</li>`).join('')}</ul>` : '';
+                return {
+                    _id: '',
+                    ID: idx + 1,
+                    Code: r.code,
+                    Name: r.name,
+                    Price: priceNumber,
+                    'In Stock': 0,
+                    Image: r.image ?? '',
+                    Images: r.image ? JSON.stringify([r.image.toString()]) : '',
+                    Category: r.category ?? '',
+                    'Item Type': 'simple',
+                    Description: descriptionHtml,
+                    Published: 1,
+                } as any;
+            });
+            const aoaDupPer: any[][] = [headers, ...rowsDupForUrl.map(row => headers.map(h => row[h] ?? ''))];
+            const wsDupPer = XLSX.utils.aoa_to_sheet(aoaDupPer);
+            const wbDupPer = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wbDupPer, wsDupPer, 'Sheet1');
+            const perDupXlsx = path.resolve(dupXlsxDir, `duplicate_output_${slug}.xlsx`);
+            XLSX.writeFile(wbDupPer, perDupXlsx);
+            console.log('Saved per-URL duplicate excel to', perDupXlsx);
+        } catch (err) {
+            console.error('Failed to write per-URL outputs for', url, err);
+        }
     }
 
-    const outPath = path.resolve(__dirname, '..', 'output.json');
+    const outJsonDir = path.resolve(__dirname, '..', 'outputs', 'data', 'json');
+    const outXlsxDir = path.resolve(__dirname, '..', 'outputs', 'data', 'xlsx');
+    const dupJsonDir = path.resolve(__dirname, '..', 'outputs', 'redundancy_data', 'json');
+    const dupXlsxDir = path.resolve(__dirname, '..', 'outputs', 'redundancy_data', 'xlsx');
     try {
+        await mkdir(outJsonDir, { recursive: true });
+        await mkdir(outXlsxDir, { recursive: true });
+        await mkdir(dupJsonDir, { recursive: true });
+        await mkdir(dupXlsxDir, { recursive: true });
+
+        const outPath = path.resolve(outJsonDir, 'outputs.json');
         await writeFile(outPath, JSON.stringify(results, null, 2), 'utf8');
         console.log('Saved results to', outPath);
-    } catch (err) {
-        console.error('Failed to write results:', err);
-    }
 
-    // write duplicates to separate files for inspection
-    const dupOutPath = path.resolve(__dirname, '..', 'duplicate_output.json');
-    try {
+        const dupOutPath = path.resolve(dupJsonDir, 'duplicate_output.json');
         await writeFile(dupOutPath, JSON.stringify(duplicates, null, 2), 'utf8');
         console.log('Saved duplicate results to', dupOutPath);
     } catch (err) {
-        console.error('Failed to write duplicate results:', err);
+        console.error('Failed to write results or create outputs directories:', err);
     }
 
     try {
@@ -787,9 +889,9 @@ test('scrape all products', async ({ page }) => {
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
 
-        const outXlsxPath = path.resolve(__dirname, '..', 'output.xlsx');
-        XLSX.writeFile(wb, outXlsxPath);
-        console.log('Saved excel to', outXlsxPath);
+    const outXlsxPath = path.resolve(outXlsxDir, 'outputs.xlsx');
+    XLSX.writeFile(wb, outXlsxPath);
+    console.log('Saved excel to', outXlsxPath);
         // write duplicates xlsx as well
         try {
             const dupRows = duplicates.map((r, idx) => {
@@ -820,7 +922,7 @@ test('scrape all products', async ({ page }) => {
             const wsDup = XLSX.utils.aoa_to_sheet(aoaDup);
             const wbDup = XLSX.utils.book_new();
             XLSX.utils.book_append_sheet(wbDup, wsDup, 'Sheet1');
-            const dupXlsxPath = path.resolve(__dirname, '..', 'duplicate_output.xlsx');
+            const dupXlsxPath = path.resolve(dupXlsxDir, 'duplicate_output.xlsx');
             XLSX.writeFile(wbDup, dupXlsxPath);
             console.log('Saved duplicate excel to', dupXlsxPath);
         } catch (err) {
