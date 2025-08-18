@@ -33,6 +33,7 @@ test('scrape all products', async ({ page }) => {
         storage: string | null
         psu: string | null
         case: string | null
+        gpu: string | null
     };
 
     function generateRandomCode(): string {
@@ -190,12 +191,22 @@ test('scrape all products', async ({ page }) => {
                 // declare spec vars here so they are available later when generating the code
                 let cpuVal: string | null = null;
                 let ramVal: string | null = null;
+                let gpu: string | null = null;
                 let storageVal: string | null = null;
                 let psuVal: string | null = null;
                 let caseVal: string | null = null;
 
                 // mornitor display
                 let resolutionVal: string | null = null;
+                // helper to normalize resolution strings
+                const normalizeResolution = (s: string) => {
+                    return s
+                        .replace(/\u00A0/g, ' ')
+                        .replace(/●/g, ' ')
+                        .replace(/\s+/g, ' ')
+                        .replace(/\s*:\s*/g, ': ')
+                        .trim();
+                };
 
                 // Prefer a description entry that looks like a title (avoid spec lines like "CPU: ...").
                 let name: string = '';
@@ -221,6 +232,9 @@ test('scrape all products', async ({ page }) => {
                     // Keys to extract; storageKeys treated together (first one wins)
                     const storageKeys = ['m2', 'm.2', 'ssd', 'storage', 'hdd', 'pci-e'];
 
+                    // normalized GPU keys (no punctuation/space) so we can compare against keyNormalized
+                    const gpuKeys = ['gpu', 'graphics', 'graphics amd', 'graphicsamd', 'vga', 'amd', 'amd radeon', 'intel®', 'nvidia', 'nvidia®'];
+
                     // Scan description lines for "Key : Value" patterns (case-insensitive),
                     // normalize key by removing non-alphanumerics so variants like "M.2", "m.2", "M.2   " are matched.
                     // Use an index loop so we can look ahead (useful for headings like "Memory" / "Processor")
@@ -228,6 +242,22 @@ test('scrape all products', async ({ page }) => {
                         const line = description[i];
                         if (!line) continue;
                         const text = line.replace(/\u00A0/g, ' ').trim();
+
+                        // Monitor resolution detection (examples: "Resolution:QHD 2560 x 1440 at 120Hz",
+                        // "Resolution : 1920 x 1080 at 120 Hz", or lines that contain "2560 x 1440")
+                        if (!resolutionVal) {
+                            const t = normalizeResolution(text);
+                            // common patterns: QHD/FHD/UHD/4K or explicit dimensions 1920 x 1080, optionally "at 120Hz"
+                            const dimRegex = /\b(QHD|FHD|UHD|4K|HD)\b|\b(\d{3,4}\s*[x×]\s*\d{3,4}(?:\s*at\s*\d+\s*Hz)?)\b/i;
+                            const keyRes = t.match(/\bResolution\b[:\s\-]*(.+)$/i);
+                            const dimMatch = t.match(dimRegex);
+                            if (keyRes && keyRes[1]) {
+                                resolutionVal = normalizeResolution(keyRes[1]);
+                            } else if (dimMatch) {
+                                // prefer the explicit dimension capture group if present
+                                resolutionVal = (dimMatch[2] || dimMatch[1] || dimMatch[0]).trim();
+                            }
+                        }
 
                         // global regex to capture multiple "Key: Value" pairs in the same line
                         const pairRegex = /([^:：]+?)\s*[:：]\s*([^:：]+?)(?=(?:\s+[^:：]+?\s*[:：])|$)/g;
@@ -256,9 +286,29 @@ test('scrape all products', async ({ page }) => {
                             // existing freeform detection inside the pair loop (kept as-is)
                             if (!storageVal) {
                                 const freeformStorageRegex = /\b(m\.?2|nvme|pci-?e|pcie|ssd|hdd|storage)\b/i;
-                                if (freeformStorageRegex.test(text)) {
-                                    const cap = text.match(/(\d+(?:\.\d+)?\s*(?:TB|GB))/i);
-                                    storageVal = (cap ? cap[0] : text).replace(/\s+/g, ' ').trim();
+                                const freeformMatch = text.match(freeformStorageRegex);
+                                if (freeformMatch) {
+                                    const token = (freeformMatch[1] || '').toLowerCase();
+                                    // Ignore m.2 / m2 when it's part of a unit like 'cd/m2' (brightness),
+                                    // i.e. when preceded by a slash. Treat only standalone m.2 as storage.
+                                    if ((token === 'm.2' || token === 'm2') && /\/\s*m\.?2\b/i.test(text)) {
+                                        // skip - likely 'cd/m2' or similar unit, do not treat as storage
+                                    } else {
+                                        const cap = text.match(/(\d+(?:\.\d+)?\s*(?:TB|GB))/i);
+                                        storageVal = (cap ? cap[0] : text).replace(/\s+/g, ' ').trim();
+                                    }
+                                }
+                            }
+
+                            // GPU key handling (mirror storageKeys flow)
+                            if (!gpu && gpuKeys.includes(keyNormalized)) {
+                                // if the value is only a brand (e.g. "AMD") prefer the next non-empty line as model
+                                const brandOnlyRegex = /^(amd|nvidia|intel|ati)$/i;
+                                const nextLine = (description[i + 1] || '').trim();
+                                if (brandOnlyRegex.test(value) && nextLine) {
+                                    gpu = nextLine.replace(/\s+/g, ' ').trim();
+                                } else {
+                                    gpu = value;
                                 }
                             }
 
@@ -267,8 +317,8 @@ test('scrape all products', async ({ page }) => {
 
                         // If no "Key: Value" pairs matched (or storage still not found),
                         // try a more robust freeform storage normalizer that captures PCIe version + capacity.
-                        if (!storageVal) {
-                            const normalizeStorageFromText = (t: string) => {
+                if (!storageVal) {
+                    const normalizeStorageFromText = (t: string) => {
                                 const s = t.replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
                                 // detect primary type
                                 const typeMatch = s.match(/\b(m\.?2|m2|nvme|mvme|ssd|hdd|storage)\b/i);
@@ -302,8 +352,15 @@ test('scrape all products', async ({ page }) => {
                             };
 
                             // run the normalizer on the whole text line
-                            if (/\b(m\.?2|m2|nvme|mvme|pci-?e|pcie|ssd|hdd|storage)\b/i.test(text)) {
-                                storageVal = normalizeStorageFromText(text);
+                            const storageTokenMatch = text.match(/\b(m\.?2|m2|nvme|mvme|pci-?e|pcie|ssd|hdd|storage)\b/i);
+                            if (storageTokenMatch) {
+                                const token = (storageTokenMatch[1] || '').toLowerCase();
+                                // ignore m.2 when it's used as a unit like 'cd/m2'
+                                if ((token === 'm.2' || token === 'm2') && /\/\s*m\.?2\b/i.test(text)) {
+                                    // do nothing - it's likely a unit (brightness), not storage
+                                } else {
+                                    storageVal = normalizeStorageFromText(text);
+                                }
                             }
                         }
 
@@ -358,6 +415,49 @@ test('scrape all products', async ({ page }) => {
                                 // lines that mention "CPUs", "core", "GHz" without "Processor"
                                 if (/\bCPUs?\b|\bcore(s)?\b|\d+(\.\d+)?\s*GHz\b/i.test(text)) {
                                     cpuVal = text.replace(/\s+/g, ' ').trim();
+                                }
+                            }
+                        }
+
+                        // Graphics/ GPU heading or freeform GPU model lines
+                        if (!gpu) {
+                            // heading "Graphics" or "Graphics:" -> prefer details on same line after keyword or next non-empty line
+                            if (/\bgraphics\b/i.test(text)) {
+                                const after = text.replace(/.*graphics[:\s\-]*?/i, '').trim();
+                                const nextLine = (description[i + 1] || '').trim();
+
+                                // tokens indicating a full model line (brand+model)
+                                const modelTokenRegex = /\b(FirePro|Radeon|GeForce|GTX|RTX|Quadro|RX|Vega|Titan|TITAN|Ti)\b/i;
+                                // common brand-only values
+                                const brandOnlyRegex = /^(AMD|NVIDIA|INTEL|ATI)$/i;
+
+                                // prefer a detailed model if available on same line or the next line
+                                if (after && modelTokenRegex.test(after)) {
+                                    gpu = after.replace(/\s+/g, ' ').trim();
+                                } else if (nextLine && modelTokenRegex.test(nextLine)) {
+                                    gpu = nextLine.replace(/\s+/g, ' ').trim();
+                                } else if (after && !brandOnlyRegex.test(after)) {
+                                    // if 'after' is non-brand shorthand (e.g. "FirePro D300 ..."), use it
+                                    gpu = after.replace(/\s+/g, ' ').trim();
+                                } else if (brandOnlyRegex.test(after) && nextLine && nextLine.length) {
+                                    // "Graphics  AMD" + next line with model -> prefer next line
+                                    gpu = nextLine.replace(/\s+/g, ' ').trim();
+                                } else if (after) {
+                                    gpu = after.replace(/\s+/g, ' ').trim();
+                                } else if (nextLine) {
+                                    gpu = nextLine.replace(/\s+/g, ' ').trim();
+                                }
+                            } else {
+                                // detect common GPU brand/model tokens in freeform lines
+                                const gpuTokenRegex = /\b(FirePro|Radeon|GeForce|GTX|RTX|Quadro|RX|Vega|AMD|NVIDIA)\b/i;
+                                if (gpuTokenRegex.test(text)) {
+                                    // prefer the more specific model line (if this line is just "Graphics  AMD", take the next line)
+                                    const nextLine = (description[i + 1] || '').trim();
+                                    if (/^\s*(AMD|NVIDIA)\s*$/i.test(text) && nextLine && gpuTokenRegex.test(nextLine)) {
+                                        gpu = nextLine.replace(/\s+/g, ' ').trim();
+                                    } else {
+                                        gpu = text.replace(/\s+/g, ' ').trim();
+                                    }
                                 }
                             }
                         }
@@ -446,14 +546,25 @@ test('scrape all products', async ({ page }) => {
                     // Build final name:
                     // - If none of cpuVal/ramVal/storageVal were found, use cleanedCandidate only.
                     // - If any were found, append the found specs (normalized) to the cleanedCandidate.
-                    const hasSpecs = Boolean(cpuVal || ramVal || storageVal || psuVal || caseVal);
+                    // treat resolution as a "monitor spec" when no other hardware specs exist
+                    const isLikelyMonitor = !cpuVal && !ramVal && !gpu && !storageVal && !psuVal && !caseVal && Boolean(resolutionVal);
+                    const hasSpecs = Boolean(cpuVal || ramVal || storageVal || psuVal || caseVal || (isLikelyMonitor && resolutionVal));
                     if (hasSpecs) {
-                        const hasPrimarySpecs = Boolean(cpuVal || ramVal || storageVal);
+                        const hasPrimarySpecs = Boolean(cpuVal || ramVal || storageVal || gpu);
                         const partsToAppend = (hasPrimarySpecs
-                            ? [cpuVal, ramVal, storageVal]
+                            ? [cpuVal, ramVal, storageVal, gpu]
                             : [psuVal, caseVal]
                         ).filter(Boolean)
                             .map(p => p!.replace(/\s+/g, ' ').trim());
+
+                        // If this is a monitor (no CPU/RAM/Storage) append resolution as the primary spec
+                        if (isLikelyMonitor && resolutionVal) {
+                            const res = normalizeResolution(resolutionVal);
+                            // avoid duplication
+                            if (!partsToAppend.map(x => (x || '').toLowerCase()).includes(res.toLowerCase())) {
+                                partsToAppend.unshift(res);
+                            }
+                        }
 
                         // new: include visible title (from .title-and-rating h2) as a prefix,
                         // but avoid duplicating it if the cleanedCandidate already starts with it.
@@ -558,7 +669,7 @@ test('scrape all products', async ({ page }) => {
 
                 if (name) {
                     // generate deterministic 8-char code based on name + price + category
-                    const propGenerateCode: PropCodeGenerateForProduct = { name, category, cpu: cpuVal, ram: ramVal, storage: storageVal, psu: psuVal, case: caseVal };
+                    const propGenerateCode: PropCodeGenerateForProduct = { name, category, cpu: cpuVal, ram: ramVal, storage: storageVal, psu: psuVal, case: caseVal, gpu };
                     const code = getCodeForProduct(propGenerateCode);
 
                     const nameWithCode = `${name} - ${code}`;

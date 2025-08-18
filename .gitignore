@@ -5,6 +5,5 @@ node_modules/
 /playwright-report/
 /blob-report/
 /playwright/.cache/
-output.json
-output.xlsx
-.~lock.output.xlsx#
+output.*
+.~lock.output.*
